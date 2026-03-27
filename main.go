@@ -378,6 +378,34 @@ func SetDeviceTemperature(deviceID string, scheduleActive bool, heat, cool *floa
 	return err
 }
 
+func SetDeviceMode(deviceID, mode, token string) error {
+	d, err := json.Marshal(map[string]any{
+		"Settings": map[string]any{
+			"Mode": mode,
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	_, err = API[any]("PATCH", fmt.Sprintf("/Device/%v", url.PathEscape(deviceID)), bytes.NewReader(d), http.StatusOK, false, token)
+	return err
+}
+
+func SetDeviceFanMode(deviceID, fanMode, token string) error {
+	d, err := json.Marshal(map[string]any{
+		"Settings": map[string]any{
+			"Fan": fanMode,
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	_, err = API[any]("PATCH", fmt.Sprintf("/Device/%v", url.PathEscape(deviceID)), bytes.NewReader(d), http.StatusOK, false, token)
+	return err
+}
+
 type ScheduleSetting struct {
 	// Cool to this temp
 	C float64 `json:"C"`
@@ -659,6 +687,26 @@ func wattsToHAMode(wattsMode string) string {
 	}
 }
 
+// haToWattsMode maps Home Assistant HVAC modes back to Watts API mode values.
+func haToWattsMode(haMode string) string {
+	switch haMode {
+	case "heat":
+		return "Heat"
+	case "cool":
+		return "Cool"
+	case "heat_cool":
+		return "Auto"
+	case "off":
+		return "Off"
+	case "fan_only":
+		return "Fan"
+	case "dry":
+		return "Dry"
+	default:
+		return haMode
+	}
+}
+
 // wattsToHAAction maps Watts operational state to HA HVAC action.
 func wattsToHAAction(op string) string {
 	switch strings.ToLower(op) {
@@ -711,6 +759,7 @@ func publishDiscovery(client mqtt.Client, device MyDevice) {
 	config := map[string]any{
 		"name":                      device.Name,
 		"unique_id":                 fmt.Sprintf("watts_%s", device.DeviceID),
+		"mode_command_topic":        prefix + "/mode/set",
 		"mode_state_topic":          prefix + "/mode/state",
 		"current_temperature_topic": prefix + "/current_temp",
 		"action_topic":              prefix + "/action",
@@ -720,6 +769,7 @@ func publishDiscovery(client mqtt.Client, device MyDevice) {
 		"max_temp":                  device.Data.Target.Max,
 		"temp_step":                 device.Data.Target.Steps,
 		"temperature_unit":          device.Data.TempUnits.Val,
+		"optimistic":                true,
 		"device": map[string]any{
 			"identifiers":  []string{fmt.Sprintf("watts_%s", device.DeviceID)},
 			"name":         device.Name,
@@ -740,6 +790,7 @@ func publishDiscovery(client mqtt.Client, device MyDevice) {
 	}
 
 	if len(device.Data.Fan.Enum) > 0 {
+		config["fan_mode_command_topic"] = prefix + "/fan/set"
 		config["fan_mode_state_topic"] = prefix + "/fan/state"
 		config["fan_modes"] = device.Data.Fan.Enum
 	}
@@ -876,7 +927,7 @@ func (ds *deviceState) IsScheduleActive(deviceID string) bool {
 	return strings.ToLower(d.Data.SchedEnable.Val) == "on" || strings.ToLower(d.Data.SchedEnable.Val) == "enabled"
 }
 
-func subscribeCommands(client mqtt.Client, device MyDevice, state *deviceState, tokens *ExchangedAuthTokenResponse, username, pass, tokensPath string, tokensMu *sync.Mutex) {
+func subscribeCommands(client mqtt.Client, device MyDevice, state *deviceState, tokens *ExchangedAuthTokenResponse, username, pass, tokensPath string, tokensMu *sync.Mutex, pubSync chan bool) {
 	prefix := mqttTopicPrefix(device.DeviceID)
 	deviceID := device.DeviceID
 
@@ -916,6 +967,7 @@ func subscribeCommands(client mqtt.Client, device MyDevice, state *deviceState, 
 		if err := SetDeviceTemperature(deviceID, schedActive, heat, cool, getToken()); err != nil {
 			log.Printf("failed to set temp on %s: %v", deviceID, err)
 		}
+		pubSync <- true
 	})
 
 	// Dual setpoint: high (cool target)
@@ -930,6 +982,7 @@ func subscribeCommands(client mqtt.Client, device MyDevice, state *deviceState, 
 		if err := SetDeviceTemperature(deviceID, schedActive, nil, &val, getToken()); err != nil {
 			log.Printf("failed to set cool target on %s: %v", deviceID, err)
 		}
+		pubSync <- true
 	})
 
 	// Dual setpoint: low (heat target)
@@ -944,6 +997,28 @@ func subscribeCommands(client mqtt.Client, device MyDevice, state *deviceState, 
 		if err := SetDeviceTemperature(deviceID, schedActive, &val, nil, getToken()); err != nil {
 			log.Printf("failed to set heat target on %s: %v", deviceID, err)
 		}
+		pubSync <- true
+	})
+
+	// Mode
+	client.Subscribe(prefix+"/mode/set", 1, func(_ mqtt.Client, msg mqtt.Message) {
+		haMode := string(msg.Payload())
+		wattsMode := haToWattsMode(haMode)
+		log.Printf("setting mode on %s: %s (watts: %s)", deviceID, haMode, wattsMode)
+		if err := SetDeviceMode(deviceID, wattsMode, getToken()); err != nil {
+			log.Printf("failed to set mode on %s: %v", deviceID, err)
+		}
+		pubSync <- true
+	})
+
+	// Fan mode
+	client.Subscribe(prefix+"/fan/set", 1, func(_ mqtt.Client, msg mqtt.Message) {
+		fanMode := string(msg.Payload())
+		log.Printf("setting fan mode on %s: %s", deviceID, fanMode)
+		if err := SetDeviceFanMode(deviceID, fanMode, getToken()); err != nil {
+			log.Printf("failed to set fan mode on %s: %v", deviceID, err)
+		}
+		pubSync <- true
 	})
 }
 
@@ -1024,8 +1099,10 @@ func main() {
 	}
 	deviceStates.Update(devices.Body)
 
+	pubSync := make(chan bool)
+
 	for _, device := range devices.Body {
-		subscribeCommands(mqttClient, device, deviceStates, &tokens, username, pass, tokensPath, &tokensMu)
+		subscribeCommands(mqttClient, device, deviceStates, &tokens, username, pass, tokensPath, &tokensMu, pubSync)
 		publishDiscovery(mqttClient, device)
 		publishState(mqttClient, device)
 	}
@@ -1039,28 +1116,35 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
+	doSync := func() {
+		// Re-authenticate if token is about to expire
+		tokensMu.Lock()
+		if tokens.ExpiresOn < int(time.Now().Add(2*time.Minute).Unix()) {
+			log.Println("token expiring soon, re-authenticating")
+			tokens = authenticate(username, pass, tokensPath)
+		}
+
+		devices, err := GetDevices(defaultLocation.LocationID, tokens.AccessToken)
+		tokensMu.Unlock()
+		if err != nil {
+			log.Printf("failed to get devices: %v", err)
+			return
+		}
+
+		deviceStates.Update(devices.Body)
+
+		for _, device := range devices.Body {
+			publishState(mqttClient, device)
+		}
+	}
+
 	for {
 		select {
+		case <-pubSync:
+			doSync()
+
 		case <-ticker.C:
-			// Re-authenticate if token is about to expire
-			tokensMu.Lock()
-			if tokens.ExpiresOn < int(time.Now().Add(2*time.Minute).Unix()) {
-				log.Println("token expiring soon, re-authenticating")
-				tokens = authenticate(username, pass, tokensPath)
-			}
-
-			devices, err := GetDevices(defaultLocation.LocationID, tokens.AccessToken)
-			tokensMu.Unlock()
-			if err != nil {
-				log.Printf("failed to get devices: %v", err)
-				continue
-			}
-
-			deviceStates.Update(devices.Body)
-
-			for _, device := range devices.Body {
-				publishState(mqttClient, device)
-			}
+			doSync()
 
 		case sig := <-sigCh:
 			log.Printf("received %v, shutting down", sig)

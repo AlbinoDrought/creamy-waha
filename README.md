@@ -35,6 +35,8 @@ The supported features:
     - Show current action: heating, cooling, idle, off
     - Show fan state: auto, on, schedule
     - Accept MQTT commands to change temperature setpoint
+    - Accept MQTT commands to change current mode
+    - Accept MQTT commands to change fan state
 
 Configuration:
 
