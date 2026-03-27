@@ -662,9 +662,9 @@ func wattsToHAMode(wattsMode string) string {
 // wattsToHAAction maps Watts operational state to HA HVAC action.
 func wattsToHAAction(op string) string {
 	switch strings.ToLower(op) {
-	case "heating":
+	case "heat", "heating":
 		return "heating"
-	case "cooling":
+	case "cool", "cooling":
 		return "cooling"
 	case "off":
 		return "off"
@@ -719,7 +719,7 @@ func publishDiscovery(client mqtt.Client, device MyDevice) {
 		"min_temp":                  device.Data.Target.Min,
 		"max_temp":                  device.Data.Target.Max,
 		"temp_step":                 device.Data.Target.Steps,
-		"temperature_unit":          "C",
+		"temperature_unit":          device.Data.TempUnits.Val,
 		"device": map[string]any{
 			"identifiers":  []string{fmt.Sprintf("watts_%s", device.DeviceID)},
 			"name":         device.Name,
@@ -757,6 +757,32 @@ func publishDiscovery(client mqtt.Client, device MyDevice) {
 		log.Printf("failed to publish discovery for %s: %v", device.DeviceID, token.Error())
 	} else {
 		log.Printf("published discovery config for %s on %s", device.Name, discoveryTopic)
+	}
+
+	// Outdoor temperature sensor
+	if device.Data.Sensors.Outdoor.Status == SensorStatusOkay {
+		sensorConfig := map[string]any{
+			"name":                "Outdoor Temperature",
+			"unique_id":           fmt.Sprintf("watts_%s_outdoor_temp", device.DeviceID),
+			"state_topic":         prefix + "/outdoor_temp",
+			"availability_topic":  prefix + "/availability",
+			"device_class":        "temperature",
+			"state_class":         "measurement",
+			"unit_of_measurement": "°" + device.Data.TempUnits.Val,
+			"device": map[string]any{
+				"identifiers":  []string{fmt.Sprintf("watts_%s", device.DeviceID)},
+				"name":         device.Name,
+				"manufacturer": "Watts",
+				"model":        device.ModelNumber,
+			},
+		}
+		sensorPayload, _ := json.Marshal(sensorConfig)
+		sensorTopic := fmt.Sprintf("homeassistant/sensor/watts_%s_outdoor_temp/config", device.DeviceID)
+		t := client.Publish(sensorTopic, 1, true, sensorPayload)
+		t.Wait()
+		if t.Error() != nil {
+			log.Printf("failed to publish outdoor temp discovery for %s: %v", device.DeviceID, t.Error())
+		}
 	}
 }
 
@@ -804,6 +830,11 @@ func publishState(client mqtt.Client, device MyDevice) {
 	default:
 		// For off/fan_only/dry, publish whatever is there
 		pub("temp/state", fmt.Sprintf("%.1f", device.Data.Target.Heat))
+	}
+
+	// Outdoor temperature
+	if device.Data.Sensors.Outdoor.Status == SensorStatusOkay {
+		pub("outdoor_temp", fmt.Sprintf("%.1f", device.Data.Sensors.Outdoor.Value))
 	}
 
 	// Fan mode
