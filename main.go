@@ -810,16 +810,18 @@ func publishDiscovery(client mqtt.Client, device MyDevice) {
 		log.Printf("published discovery config for %s on %s", device.Name, discoveryTopic)
 	}
 
-	// Outdoor temperature sensor
-	if device.Data.Sensors.Outdoor.Status == SensorStatusOkay {
+	// Standalone sensor entities. The climate entity carries the room readings as
+	// attributes, but those aren't usable as temperature/humidity sources in HA,
+	// so mirror them as sensors too.
+	publishSensor := func(idSuffix, name, stateTopic, deviceClass, unit string) {
 		sensorConfig := map[string]any{
-			"name":                "Outdoor Temperature",
-			"unique_id":           fmt.Sprintf("watts_%s_outdoor_temp", device.DeviceID),
-			"state_topic":         prefix + "/outdoor_temp",
+			"name":                name,
+			"unique_id":           fmt.Sprintf("watts_%s_%s", device.DeviceID, idSuffix),
+			"state_topic":         stateTopic,
 			"availability_topic":  prefix + "/availability",
-			"device_class":        "temperature",
+			"device_class":        deviceClass,
 			"state_class":         "measurement",
-			"unit_of_measurement": "°" + device.Data.TempUnits.Val,
+			"unit_of_measurement": unit,
 			"device": map[string]any{
 				"identifiers":  []string{fmt.Sprintf("watts_%s", device.DeviceID)},
 				"name":         device.Name,
@@ -828,12 +830,26 @@ func publishDiscovery(client mqtt.Client, device MyDevice) {
 			},
 		}
 		sensorPayload, _ := json.Marshal(sensorConfig)
-		sensorTopic := fmt.Sprintf("homeassistant/sensor/watts_%s_outdoor_temp/config", device.DeviceID)
+		sensorTopic := fmt.Sprintf("homeassistant/sensor/watts_%s_%s/config", device.DeviceID, idSuffix)
 		t := client.Publish(sensorTopic, 1, true, sensorPayload)
 		t.Wait()
 		if t.Error() != nil {
-			log.Printf("failed to publish outdoor temp discovery for %s: %v", device.DeviceID, t.Error())
+			log.Printf("failed to publish %s discovery for %s: %v", idSuffix, device.DeviceID, t.Error())
 		}
+	}
+
+	degrees := "°" + device.Data.TempUnits.Val
+
+	if device.Data.Sensors.Room.Status == SensorStatusOkay {
+		publishSensor("room_temp", "Temperature", prefix+"/current_temp", "temperature", degrees)
+	}
+
+	if device.Data.Sensors.Rh.Status == SensorStatusOkay {
+		publishSensor("humidity", "Humidity", prefix+"/current_humidity", "humidity", "%")
+	}
+
+	if device.Data.Sensors.Outdoor.Status == SensorStatusOkay {
+		publishSensor("outdoor_temp", "Outdoor Temperature", prefix+"/outdoor_temp", "temperature", degrees)
 	}
 }
 
@@ -866,21 +882,34 @@ func publishState(client mqtt.Client, device MyDevice) {
 	haMode := wattsToHAMode(device.Data.Mode.Val)
 	pub("mode/state", haMode)
 
-	// Target temperatures
+	// Target temperatures.
+	//
+	// The climate entity advertises both a single setpoint and a setpoint range,
+	// and HA picks which one to draw from whichever attributes are set — with the
+	// single setpoint winning. So the setpoints that don't apply to the current
+	// mode have to be actively cleared, otherwise heat_cool renders as a one-handle
+	// dial sitting on the heat target. "None" is the payload MQTT climate treats as
+	// "attribute unset".
+	const unset = "None"
 	switch haMode {
 	case "heat_cool":
 		// Dual setpoint: publish both high (cool) and low (heat) targets
 		pub("temp_high/state", fmt.Sprintf("%.1f", device.Data.Target.Cool))
 		pub("temp_low/state", fmt.Sprintf("%.1f", device.Data.Target.Heat))
-		// Single target isn't meaningful in this mode, but publish heat as default
-		pub("temp/state", fmt.Sprintf("%.1f", device.Data.Target.Heat))
+		pub("temp/state", unset)
 	case "cool":
 		pub("temp/state", fmt.Sprintf("%.1f", device.Data.Target.Cool))
+		pub("temp_high/state", unset)
+		pub("temp_low/state", unset)
 	case "heat":
 		pub("temp/state", fmt.Sprintf("%.1f", device.Data.Target.Heat))
+		pub("temp_high/state", unset)
+		pub("temp_low/state", unset)
 	default:
 		// For off/fan_only/dry, publish whatever is there
 		pub("temp/state", fmt.Sprintf("%.1f", device.Data.Target.Heat))
+		pub("temp_high/state", unset)
+		pub("temp_low/state", unset)
 	}
 
 	// Outdoor temperature
